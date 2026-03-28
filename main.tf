@@ -1,0 +1,178 @@
+# configure aws provider
+# this tells terraform which region to deploy resources
+provider "aws" {
+  region = "ap-southeast-1"
+}
+
+# aliased provider for ACM (us-east-1)
+provider "aws" {
+  alias  = "us_east_1"
+  region = "us-east-1"
+}
+
+# create a private s3 bucket
+resource "aws_s3_bucket" "site" {
+  bucket = "faizal-tf-cf-s3-bucket"
+}
+
+# block all public access to the bucket
+resource "aws_s3_bucket_public_access_block" "site" {
+  bucket = aws_s3_bucket.site.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+# cloudfront origin access control (oac)
+resource "aws_cloudfront_origin_access_control" "site" {
+  name                              = "s3-oac"
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+# old cloudfront default certificate commented out
+# viewer_certificate {
+#   cloudfront_default_certificate = true
+# }
+
+# create ACM certificate for CloudFront with automatic DNS validation
+resource "aws_acm_certificate" "site_cert" {
+  provider          = aws.us_east_1
+  domain_name       = "faizal-tf-cf-s3-bucket.sctp-sandbox.com"
+  validation_method = "DNS"
+}
+
+# get the hosted zone
+data "aws_route53_zone" "site" {
+  name         = "sctp-sandbox.com"
+  private_zone = false
+}
+
+# create DNS validation record
+resource "aws_route53_record" "cert_validation" {
+  for_each = {
+    for dvo in aws_acm_certificate.site_cert.domain_validation_options :
+    dvo.domain_name => dvo
+  }
+
+  zone_id = data.aws_route53_zone.site.zone_id
+  name    = each.value.resource_record_name
+  type    = each.value.resource_record_type
+  records = [each.value.resource_record_value]
+  ttl     = 60
+}
+
+# validate the ACM certificate after DNS record creation
+resource "aws_acm_certificate_validation" "site_cert_validation" {
+  provider                = aws.us_east_1
+  certificate_arn         = aws_acm_certificate.site_cert.arn
+  validation_record_fqdns = [for record in aws_route53_record.cert_validation : record.fqdn]
+}
+
+# create cloudfront distribution
+resource "aws_cloudfront_distribution" "site" {
+
+  enabled             = true
+  default_root_object = "index.html"
+
+  origin {
+    domain_name              = aws_s3_bucket.site.bucket_regional_domain_name
+    origin_id                = "s3"
+    origin_access_control_id = aws_cloudfront_origin_access_control.site.id
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "s3"
+    viewer_protocol_policy = "redirect-to-https"
+    allowed_methods        = ["GET", "HEAD"]
+    cached_methods         = ["GET", "HEAD"]
+
+    forwarded_values {
+      query_string = false
+      cookies { forward = "none" }
+    }
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  # set custom domain alias
+  aliases = ["faizal-tf-cf-s3-bucket.sctp-sandbox.com"]
+
+  # updated viewer_certificate using ACM
+  viewer_certificate {
+    acm_certificate_arn      = aws_acm_certificate_validation.site_cert_validation.certificate_arn
+    ssl_support_method       = "sni-only"
+    minimum_protocol_version = "TLSv1.2_2021"
+  }
+}
+
+# create route53 alias record pointing to cloudfront
+resource "aws_route53_record" "site_alias" {
+  zone_id = data.aws_route53_zone.site.zone_id
+  name    = "faizal-tf-cf-s3-bucket.sctp-sandbox.com"
+  type    = "A"
+
+  alias {
+    name                   = aws_cloudfront_distribution.site.domain_name
+    zone_id                = aws_cloudfront_distribution.site.hosted_zone_id
+    evaluate_target_health = false
+  }
+}
+
+# bucket policy to allow cloudfront to read files
+resource "aws_s3_bucket_policy" "site" {
+  bucket = aws_s3_bucket.site.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Principal = { Service = "cloudfront.amazonaws.com" }
+        Action   = "s3:GetObject"
+        Resource = "${aws_s3_bucket.site.arn}/*"
+        Condition = {
+          StringEquals = { "AWS:SourceArn" = aws_cloudfront_distribution.site.arn }
+        }
+      }
+    ]
+  })
+}
+
+# optional waf to protect CloudFront from malicious requests
+# this is a web access control list (ACL) for layer 7 security
+resource "aws_wafv2_web_acl" "site_waf" {
+  provider = aws.us_east_1
+  
+  # name of the WAF ACL
+  name  = "site-waf"
+  
+  # scope defines where the WAF applies
+  # CLOUDFRONT = protects a CloudFront distribution globally
+  scope = "CLOUDFRONT"
+ 
+  # default action for requests not matching any rules
+  # here, we allow all requests by default
+  default_action { 
+    allow {} 
+  }
+ 
+  # visibility configuration for monitoring in CloudWatch
+  visibility_config {
+    # enable sending metrics to CloudWatch
+    cloudwatch_metrics_enabled = true
+    
+    # the name of the metric in CloudWatch
+    metric_name = "siteWAF"
+    
+    # enable sampling of requests for logging
+    sampled_requests_enabled   = true
+  }
+}
