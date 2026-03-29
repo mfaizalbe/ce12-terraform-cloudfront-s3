@@ -10,8 +10,20 @@ provider "aws" {
   region = "us-east-1"
 }
 
+variable "subdomain" {
+  type = string
+  default = "faizal-tf-cf-s3-bucket"
+}
+
+locals {
+  # use local variable
+  domain = "sctp-sandbox.com"
+  fqdn = "${var.subdomain}.sctp-sandbox.com"
+}
+
 # create a private s3 bucket
 resource "aws_s3_bucket" "site" {
+  # use bucket_prefix so that configuration is idempotent
   bucket = "faizal-tf-cf-s3-bucket"
 }
 
@@ -150,7 +162,7 @@ resource "aws_s3_bucket_policy" "site" {
 # this is a web access control list (ACL) for layer 7 security
 resource "aws_wafv2_web_acl" "site_waf" {
   provider = aws.us_east_1
-  
+
   # name of the WAF ACL
   name  = "site-waf"
   
